@@ -1,0 +1,96 @@
+name: Discord Notify
+on:
+  push:
+    branches: [main]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 2
+
+      - name: Create Release and Send to Discord
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CLEAN_URL=$(echo "$WEBHOOK_URL" | tr -d '[:space:]')
+
+          FILES=$(git diff --name-status HEAD~1 HEAD)
+          ADDED=$(echo "$FILES" | grep '^A' | cut -f2)
+          MODIFIED=$(echo "$FILES" | grep '^M' | cut -f2)
+          REMOVED=$(echo "$FILES" | grep '^D' | cut -f2)
+
+          MSG="${{ github.event.head_commit.message }}"
+          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+          TAG="release-${SHORT_SHA}"
+
+          ALL_FILES=""
+          if [ -n "$ADDED" ]; then
+            ALL_FILES="${ALL_FILES}${ADDED}"$'\n'
+          fi
+          if [ -n "$MODIFIED" ]; then
+            ALL_FILES="${ALL_FILES}${MODIFIED}"$'\n'
+          fi
+
+          CODEBLOCK=""
+          DOWNLOAD_BUTTONS=""
+
+          if [ -n "$ALL_FILES" ]; then
+            gh release create "$TAG" \
+              --title "Release $SHORT_SHA" \
+              --notes "$MSG"
+
+            while IFS= read -r file; do
+              if [ -n "$file" ]; then
+                FILENAME=$(basename "$file")
+
+                gh release upload "$TAG" "$file" --clobber
+
+                DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${FILENAME}"
+
+                CODEBLOCK="${CODEBLOCK}loadstring(game:HttpGet(\"https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/main/${FILENAME}\"))()\n"
+                DOWNLOAD_BUTTONS="${DOWNLOAD_BUTTONS}[${FILENAME}](${DOWNLOAD_URL})\n"
+              fi
+            done <<< "$ALL_FILES"
+          fi
+
+          if [ -n "$CODEBLOCK" ]; then
+            CODEBLOCK=$(echo -e "$CODEBLOCK" | sed '/^$/d')
+          fi
+          if [ -n "$DOWNLOAD_BUTTONS" ]; then
+            DOWNLOAD_BUTTONS=$(echo -e "$DOWNLOAD_BUTTONS" | sed '/^$/d')
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg msg "$MSG" \
+            --arg added "$ADDED" \
+            --arg modified "$MODIFIED" \
+            --arg removed "$REMOVED" \
+            --arg codeblock "$CODEBLOCK" \
+            --arg downloads "$DOWNLOAD_BUTTONS" \
+            '{
+              embeds: [{
+                title: "Commit Pushed",
+                color: 2829617,
+                fields: [
+                  {name: "Commit Message", value: $msg},
+                  {name: "Added", value: ($added | if . == "" then "None" else . end)},
+                  {name: "Modified", value: ($modified | if . == "" then "None" else . end)},
+                  {name: "Removed", value: ($removed | if . == "" then "None" else . end)},
+                  {name: "Download", value: (if $downloads != "" then $downloads else "No files to download" end), inline: false},
+                  {name: "Loadstring", value: ("```lua\n" + $codeblock + "\n```"), inline: false}
+                ]
+              }]
+            }')
+
+          if [ -n "$CODEBLOCK" ]; then
+            curl -H "Content-Type: application/json" -X POST -d "$PAYLOAD" "$CLEAN_URL"
+          else
+            echo "No files added or modified, skipping webhook"
+          fi
